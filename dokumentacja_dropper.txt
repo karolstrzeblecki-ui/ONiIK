@@ -1,0 +1,219 @@
+================================================================================
+                   DOKUMENTACJA DROPPERA
+                   ONiIK WAT 2025/2026
+================================================================================
+
+Plik: delivery/dropper.py
+Kompilowany do: WindowsUpdateHelper.exe
+Przeznaczenie: dostarczenie i osadzenie agenta na komputerze ofiary
+
+
+================================================================================
+1. OPIS OGOLNY
+================================================================================
+
+Dropper jest plikiem wykonywalnym udajacym narzedzie systemowe "Windows Update
+Helper". Po uruchomieniu przez operatora z uprawnieniami administratora wykonuje
+ciag operacji prowadzacych do osadzenia agenta w systemie, a nastepnie wyswietla
+komunikat o pomyslnej aktualizacji i usuwa sam siebie.
+
+Kolejnosc operacji:
+  1. Wylaczenie monitoringu behawioralnego Windows Defender
+  2. Dodanie wykluczen sciezkowych i procesowych do Defendera
+  3. Pauza (5 sekund) na propagacje zmian w rejestrze
+  4. Kopiowanie agenta do katalogu docelowego i uruchomienie go
+  5. Pauza (5 sekund) na uruchomienie i stabilizacje agenta
+  6. Usuniecie tymczasowego wykluczenia katalogu TEMP
+  7. Wyswietlenie komunikatu "Aktualizacja zakonczona pomyslnie"
+  8. Usuniecie pliku droppera z dysku (self-delete)
+
+
+================================================================================
+2. STALE KONFIGURACYJNE
+================================================================================
+
+AGENT_RESOURCE_NAME = "RuntimeBroker.exe"
+  Nazwa pliku agenta spakowanego wewnatrz droppera jako zasob PyInstallera.
+
+INSTALL_DIR_USER
+  Sciezka katalogu instalacji w profilu uzytkownika:
+  %APPDATA%\Microsoft\Windows\RuntimeBroker\
+
+INSTALL_DIR_ALLUSERS
+  Sciezka katalogu instalacji wspolna dla wszystkich uzytkownikow:
+  %ProgramData%\Microsoft\Windows\RuntimeBroker\
+  Uzywana do dodania wykluczen Defender (obie sciezki sa wykluczone
+  prewencyjnie, niezaleznie od tego ktora zostanie ostatecznie uzyta).
+
+Klucze rejestru Windows Defender:
+  DEFENDER_EXCLUSIONS_PATHS    — HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths
+  DEFENDER_EXCLUSIONS_PROCESSES — HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes
+  DEFENDER_REALTIME            — HKLM\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection
+
+
+================================================================================
+3. FUNKCJE
+================================================================================
+
+--------------------------------------------------------------------------------
+get_bundled_agent_path()
+--------------------------------------------------------------------------------
+  Zwraca sciezke do pliku agenta spakowanego wewnatrz droppera.
+  W trybie skompilowanym (frozen=True) plik znajduje sie w katalogu
+  tymczasowym sys._MEIPASS, gdzie PyInstaller wypakowuje zasoby.
+  W trybie deweloperskim (uruchomienie z kodu zrodlowego) szuka pliku
+  w agent/dist/RuntimeBroker.exe wzgledem lokalizacji droppera.
+
+--------------------------------------------------------------------------------
+disable_defender_monitoring()
+--------------------------------------------------------------------------------
+  Wylacza monitoring behawioralny i real-time Windows Defender przez
+  bezposredni zapis do rejestru. Ustawia nastepujace wartosci DWORD=1
+  w kluczu HKLM\...\Real-Time Protection:
+
+  - DisableBehaviorMonitoring  — wylacza analize behawioralna procesow
+  - DisableOnAccessProtection  — wylacza skanowanie plikow przy dostepie
+  - DisableScanOnRealtimeEnable — wylacza skan przy wlaczeniu ochrony
+  - DisableIOAVProtection      — wylacza skanowanie pobranych plikow
+
+  Metoda przez rejestr (winreg) jest uzywana zamiast polecen PowerShell,
+  poniewaz PowerShell jest monitorowany przez AMSI (Antimalware Scan
+  Interface) i wywolanie Add-MpPreference jest flagowane przez Defendera
+  jako sygnatura MpTamperBulkExcl.
+
+  Wymaga uprawnien administratora. Flaga KEY_WOW64_64KEY zapewnia zapis
+  do 64-bitowej galezi rejestru niezaleznie od architektury procesu.
+
+--------------------------------------------------------------------------------
+restore_defender_monitoring()
+--------------------------------------------------------------------------------
+  Przywraca monitoring Defendera poprzez usuniecie wartosci rejestru
+  ustawionych przez disable_defender_monitoring(). W biezacej wersji
+  funkcja jest zdefiniowana, ale nie jest wywolywana — monitoring
+  pozostaje wylaczony aby wykluczenia sciezkowe chroniace agenta
+  nie zostaly podwazone przez analize behawioralna.
+
+--------------------------------------------------------------------------------
+add_defender_exclusions()
+--------------------------------------------------------------------------------
+  Dodaje wykluczenia do Windows Defender przez rejestr. Wykluczone
+  elementy:
+
+  Sciezki (Exclusions\Paths):
+  - Katalog instalacji uzytkownika (INSTALL_DIR_USER)
+  - Katalog instalacji wspolny (INSTALL_DIR_ALLUSERS)
+  - Pelna sciezka do exe agenta w obu katalogach
+  - Katalog %TEMP% (tymczasowo — dla ekstrakcji PyInstallera _MEI*)
+
+  Procesy (Exclusions\Processes):
+  - Nazwa pliku agenta (RuntimeBroker.exe)
+  - Pelna sciezka do exe agenta w obu katalogach
+
+  Wartosci zapisywane sa jako REG_DWORD o wartosci 0. Defender
+  odczytuje te klucze i pomija wymienione sciezki/procesy.
+
+--------------------------------------------------------------------------------
+remove_temp_exclusion()
+--------------------------------------------------------------------------------
+  Usuwa wykluczenie katalogu %TEMP% z rejestru Defendera. Wykluczenie
+  TEMP jest dodawane tymczasowo, aby Defender nie zablokował pliku
+  agenta podczas ekstrakcji z archiwum PyInstallera (katalog _MEI*
+  w TEMP). Po skopiowaniu agenta do docelowego katalogu wykluczenie
+  TEMP jest niepotrzebne i zostaje usuniete.
+
+--------------------------------------------------------------------------------
+show_fake_progress()
+--------------------------------------------------------------------------------
+  Wyswietla okno dialogowe MessageBox z komunikatem:
+  "Aktualizacja systemu Windows zakonczona pomyslnie.
+   Zmiany wejda w zycie po ponownym uruchomieniu komputera."
+  Tytul okna: "Windows Update Helper"
+  Ikona: informacyjna (MB_ICONINFORMATION)
+
+  Jest to jedyny element widoczny dla operatora — cala poprzedzajaca
+  aktywnosc (wykluczenia, kopiowanie, uruchomienie agenta) odbywa
+  sie w tle bez zadnych efektow wizualnych.
+
+--------------------------------------------------------------------------------
+install_agent()
+--------------------------------------------------------------------------------
+  Kopiuje agenta z zasobow droppera do katalogu docelowego i uruchamia go.
+
+  Kroki:
+  1. Pobiera sciezke do spakowanego agenta (get_bundled_agent_path)
+  2. Tworzy katalog docelowy (INSTALL_DIR_USER) jesli nie istnieje
+  3. Kopiuje plik agenta (shutil.copy2 — zachowuje metadane pliku)
+  4. Uruchamia agenta jako niezalezny proces poleceniem:
+     cmd /c start "" /B "<sciezka>"
+     z flagami CREATE_NO_WINDOW i DETACHED_PROCESS
+
+  Uzycie "cmd /c start /B" zamiast bezposredniego subprocess.Popen
+  powoduje ze agent nie jest procesem-dzieckiem droppera. Dzieki temu
+  w menedzerze zadan agent nie pojawia sie pod drzewem droppera
+  i nie jest zamykany razem z nim.
+
+--------------------------------------------------------------------------------
+self_delete_dropper()
+--------------------------------------------------------------------------------
+  Usuwa plik droppera po zakonczeniu wszystkich operacji.
+
+  Mechanizm:
+  Proces nie moze usunac wlasnego pliku wykonywalnego w trakcie
+  dzialania. Dlatego generowany jest skrypt .bat w katalogu %TEMP%
+  o nazwie upd_cleanup.bat, ktory:
+  1. Czeka 4 sekundy (ping 127.0.0.1 -n 4) az dropper sie zakonczy
+  2. Usuwa plik droppera (del /f /q)
+  3. Usuwa sam siebie (del /f /q %~f0)
+
+  Skrypt jest uruchamiany w ukrytym oknie (SW_HIDE, CREATE_NO_WINDOW).
+
+  Po wykonaniu tej funkcji na dysku nie pozostaje plik droppera —
+  jedynym sladem jest dzialajacy agent w katalogu AppData.
+
+
+================================================================================
+4. PRZEPLYW GLOWNY — main()
+================================================================================
+
+  Krok 1: disable_defender_monitoring()
+    Wylaczenie monitoringu behawioralnego i real-time Defendera.
+    Konieczne PRZED jakakolwiek operacja na plikach, poniewaz Defender
+    analizuje zachowanie procesow (tworzenie plikow, wpisy do rejestru)
+    i moze zablokowac droppera zanim zdazy zainstalowac agenta.
+
+  Krok 2: add_defender_exclusions()
+    Dodanie wykluczen sciezkowych i procesowych. Wykluczenia chronia
+    agenta na stale — nawet po ponownym wlaczeniu monitoringu.
+
+  Krok 3: time.sleep(5)
+    Pauza 5 sekund. Defender potrzebuje czasu na odswiezenie wewnetrznej
+    listy wykluczen po zmianach w rejestrze. Bez tej pauzy Defender
+    moze zdazyc przeskanowac kopiowany plik zanim wykluczenie zacznie
+    obowiazywac.
+
+  Krok 4: install_agent()
+    Kopiowanie agenta do %APPDATA%\Microsoft\Windows\RuntimeBroker\
+    i uruchomienie go jako niezaleznego procesu.
+
+  Krok 5: time.sleep(5)
+    Pauza 5 sekund na uruchomienie agenta. Agent po starcie wykonuje
+    wlasna instalacje (persystencja, timestamp) — pauza daje mu czas
+    na zakonczenie tych operacji.
+
+  Krok 6: (monitoring NIE jest przywracany)
+    Swiadoma decyzja projektowa. Wykluczenia sciezkowe i procesowe
+    chronia agenta, ale monitoring behawioralny mogl by wykryc
+    wzorce zachowania (np. okresowe polaczenia sieciowe + zapis
+    do rejestru). Wylaczenie monitoringu eliminuje to ryzyko.
+
+  Krok 7: remove_temp_exclusion()
+    Usuniecie tymczasowego wykluczenia katalogu %TEMP%.
+
+  Krok 8: show_fake_progress()
+    Wyswietlenie komunikatu dla operatora. Jest to jedyna interakcja
+    widoczna dla uzytkownika — wszystko wczesniejsze odbywa sie w tle.
+
+  Krok 9: self_delete_dropper()
+    Usuniecie pliku droppera z dysku. Po kliknieciu OK w komunikacie
+    plik WindowsUpdateHelper.exe znika z lokalizacji z ktorej
+    zostal uruchomiony.
