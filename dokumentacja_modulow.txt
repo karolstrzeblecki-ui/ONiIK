@@ -1,0 +1,301 @@
+================================================================================
+                   DOKUMENTACJA MODULOW AGENTA
+                   ONiIK WAT 2025/2026
+================================================================================
+
+
+================================================================================
+1. main.py — Glowny modul agenta
+================================================================================
+
+Punkt wejscia programu. Odpowiada za orkiestracje wszystkich pozostalych modulow.
+
+Kolejnosc operacji po uruchomieniu:
+  1. Ukrycie procesu (stealth.apply_stealth)
+  2. Sprawdzenie czy TTL nie wygas — jesli tak, autodestrukcja
+  3. Jesli pierwsze uruchomienie — instalacja (kopiowanie do AppData,
+     dodanie wykluczen Defender, wpis persystencji w rejestrze)
+  4. Logowanie do serwera Matrix i wyslanie wiadomosci powitalnej [ONLINE]
+  5. Uruchomienie keyloggera w osobnym watku
+  6. Uruchomienie watku nasluchujacego komend C2 z pokoju Matrix
+  7. Petla glowna: co EXFIL_INTERVAL sekund odczytuje bufor keyloggera
+     i wysyla zaszyfrowane dane do Matrix
+
+Funkcje:
+  log_error(msg)        — zapisuje komunikat diagnostyczny do pliku .debug.log
+  c2_listener(exfil,kl) — watek nasluchujacy komend (/delete, /status, /ping)
+  first_run_setup()     — jednorazowa instalacja agenta na komputerze ofiary
+  main()                — glowna petla programu
+
+Obsluga bledow:
+  Kazdy blad jest przechwytywany i zapisywany do pliku logu. Agent nigdy
+  nie wyswietla bledow operatorowi — dziala cicho nawet w przypadku awarii.
+
+Flaga _shutdown:
+  Obiekt threading.Event ustawiana przez komende /delete lub TTL expiry.
+  Powoduje zakonczenie petli glownej i watku C2 listener.
+
+
+================================================================================
+2. config.py — Konfiguracja agenta
+================================================================================
+
+Centralne miejsce konfiguracji. Wszystkie parametry agenta sa zdefiniowane
+jako stale w tym pliku. Zmiana konfiguracji wymaga edycji tego pliku przed
+kompilacja.
+
+Parametry:
+  MATRIX_HOMESERVER   — adres serwera Matrix (np. https://matrix.org)
+  MATRIX_USER         — identyfikator konta agenta (np. @user:matrix.org)
+  MATRIX_PASSWORD     — haslo do konta agenta
+  MATRIX_ROOM_ID      — identyfikator pokoju docelowego (np. !abc:matrix.org)
+  PROCESS_NAME        — nazwa procesu widoczna w menedzerze zadan
+  REGISTRY_KEY_NAME   — nazwa wpisu w rejestrze Run
+  INSTALL_DIR         — sciezka katalogu instalacji (%APPDATA%\Microsoft\Windows\RuntimeBroker)
+  INSTALL_FILENAME    — nazwa pliku wykonywalnego agenta (RuntimeBroker.exe)
+  EXFIL_INTERVAL      — interwal wysylania logow w sekundach (domyslnie 60)
+  EXFIL_BUFFER_LIMIT  — limit bufora w znakach, po przekroczeniu natychmiastowe wyslanie
+  TTL_DAYS            — czas zycia agenta w dniach (0 = uzyj TTL_MINUTES)
+  TTL_MINUTES         — czas zycia agenta w minutach (domyslnie 15)
+  INSTALL_TIMESTAMP_FILE — nazwa pliku przechowujacego date instalacji
+  AES_PASSWORD        — haslo do szyfrowania AES-256 (wspolne z deszyfratorem)
+  ENCRYPT_MESSAGES    — flaga wlaczajaca/wylaczajaca szyfrowanie (True/False)
+  C2_POLL_INTERVAL    — interwal sprawdzania komend z Matrix w sekundach
+
+
+================================================================================
+3. keylogger.py — Modul keyloggera
+================================================================================
+
+Przechwytuje nacisnecia klawiszy za pomoca biblioteki pynput (hook
+WH_KEYBOARD_LL na poziomie systemu operacyjnego).
+
+Detekcja aktywnego okna:
+  Przy kazdym nacisnieciu klawisza modul odpytuje Windows API:
+  - GetForegroundWindow() — uchwyt aktywnego okna
+  - GetWindowTextW() — tytul okna (np. "Nowy dokument - Notatnik")
+  - GetWindowThreadProcessId() + QueryFullProcessImageNameW() — nazwa
+    procesu (np. "notepad.exe", "chrome.exe")
+
+Format wyjsciowy:
+  [2026-06-04 12:00:15 | chrome.exe | Google] wpisany tekst
+
+Grupowanie klawiszy:
+  - Znaki sa grupowane w linie z jednym timestampem
+  - Nowa linia rozpoczyna sie gdy:
+    (a) uzytkownik wcisnie Enter
+    (b) minie 5 sekund ciszy (line_timeout)
+    (c) zmieni sie aktywne okno
+  - Klawisze specjalne sa mapowane na czytelne etykiety:
+    spacja=" ", enter="[ENTER]", backspace="[BS]", tab="[TAB]" itd.
+  - Klawisze Shift i AltGr (prawy Alt) sa filtrowane z wyjscia,
+    poniewaz generuja szum przy polskich znakach diakrytycznych
+
+Bezpieczenstwo watkowe:
+  Bufor jest chroniony obiektem threading.Lock. Metoda flush() zwraca
+  zawartosc bufora i czysci go atomowo.
+
+Funkcje:
+  start()       — uruchamia listener klawiatury w watku daemon
+  stop()        — zatrzymuje listener
+  flush()       — zwraca i czysci bufor (thread-safe)
+  buffer_size() — zwraca liczbe znakow w buforze
+
+
+================================================================================
+4. exfiltrator.py — Modul exfiltracji (C2 Matrix)
+================================================================================
+
+Obsluguje dwukierunkowa komunikacje z serwerem Matrix za pomoca REST API
+(Matrix Client-Server API). Uzywa wylacznie biblioteki standardowej urllib.
+
+Logowanie:
+  Metoda _login() wysyla POST na /_matrix/client/r0/login z danymi
+  uwierzytelniajacymi (m.login.password). Otrzymuje access_token uzywany
+  do autoryzacji kolejnych zadan.
+
+Wysylanie wiadomosci:
+  Metoda _send_message() wysyla PUT na endpoint
+  /rooms/{room_id}/send/m.room.message/{txn_id}. Kazda wiadomosc ma
+  unikalny transaction ID (inkrementowany licznik). Jesli token wygasnie,
+  modul automatycznie ponawia logowanie.
+
+Szyfrowanie:
+  Jesli ENCRYPT_MESSAGES=True, tekst jest szyfrowany modulem crypto.py
+  przed wyslaniem. Zaszyfrowana wiadomosc ma prefix [ENC] i jest
+  zakodowana w base64.
+
+Dzielenie dlugich wiadomosci:
+  Wiadomosci przekraczajace 60000 znakow sa dzielone na czesci.
+
+Odbior komend (polling):
+  Metoda check_commands() wywoluje GET /sync z parametrem since={next_batch}.
+  Filtruje wiadomosci: akceptuje tylko te niepochodzace od samego agenta
+  i zaczynajace sie od "/". Zwraca liste komend (stringow).
+
+Pomijanie starych wiadomosci:
+  Przy inicjalizacji metoda _flush_old_updates() wykonuje sync z
+  parametrem filter timeline limit=0, aby pobrac aktualny sync token
+  bez odczytywania historii. Dzieki temu agent nie reaguje na komendy
+  wyslane przed jego uruchomieniem.
+
+Obsluga SSL:
+  Modul prubuje trzech strategii kontekstu SSL:
+  1. Certyfikaty z biblioteki certifi
+  2. Domyslny kontekst systemowy
+  3. Fallback bez weryfikacji (dla srodowisk laboratoryjnych)
+
+
+================================================================================
+5. crypto.py — Modul szyfrowania AES-256-CBC
+================================================================================
+
+Czysta implementacja algorytmu AES-256 w jezyku Python, bez zewnetrznych
+bibliotek kryptograficznych.
+
+Algorytm AES:
+  Implementacja obejmuje pelny cykl szyfrowania AES-256 (14 rund):
+  - SubBytes / InvSubBytes (S-Box i odwrotny S-Box, tablice 256 elementow)
+  - ShiftRows / InvShiftRows (przesuniecie wierszy macierzy stanu)
+  - MixColumns / InvMixColumns (mieszanie kolumn w polu GF(2^8))
+  - AddRoundKey (XOR stanu z kluczem rundowym)
+  - KeyExpansion (rozszerzenie klucza 256-bit do 60 slow 32-bit)
+
+Tryb CBC:
+  - Kazdy blok plaintextu jest XOR-owany z poprzednim blokiem ciphertextu
+    (lub z IV dla pierwszego bloku)
+  - IV (Initialization Vector) jest generowany losowo (os.urandom(16))
+    dla kazdej operacji szyfrowania
+
+Derivacja klucza:
+  Funkcja derive_key() uzywa PBKDF2-HMAC-SHA256 z biblioteki hashlib:
+  - Haslo: konfigurowalny string z config.py (AES_PASSWORD)
+  - Sol: statyczna ("ONiIK_WAT_2026_salt")
+  - Iteracje: 100 000
+  - Dlugosc klucza: 32 bajty (256 bitow)
+
+Padding:
+  PKCS7 — dodaje N bajtow o wartosci N (gdzie N = 16 - len(data) % 16).
+
+Format wyjsciowy:
+  base64(IV_16_bajtow + ciphertext)
+
+Funkcje:
+  encrypt(plaintext, password) — szyfruje tekst, zwraca base64
+  decrypt(b64_ciphertext, password) — deszyfruje base64, zwraca tekst
+
+
+================================================================================
+6. persistence.py — Modul persystencji
+================================================================================
+
+Zapewnia przetrwanie agenta po restarcie systemu operacyjnego.
+
+Mechanizm:
+  Wpis w rejestrze Windows pod kluczem:
+  HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
+  Nazwa wpisu: "RuntimeBroker"
+  Wartosc: sciezka do pliku wykonywalnego agenta w cudzyslowach
+
+  System Windows automatycznie uruchamia programy zarejestrowane
+  w tym kluczu przy logowaniu uzytkownika.
+
+Instalacja:
+  Funkcja install_to_appdata() kopiuje biezacy plik wykonywalny do
+  katalogu %APPDATA%\Microsoft\Windows\RuntimeBroker\RuntimeBroker.exe.
+  Jesli agent jest juz uruchomiony z tego katalogu, kopiowanie jest pomijane.
+
+Funkcje:
+  get_install_path()            — zwraca docelowa sciezke agenta
+  install_to_appdata()          — kopiuje exe do katalogu instalacji
+  add_registry_persistence()    — dodaje wpis do rejestru Run
+  remove_registry_persistence() — usuwa wpis z rejestru (przy autodestrukcji)
+  is_running_from_install_dir() — sprawdza czy agent dziala z katalogu docelowego
+
+
+================================================================================
+7. stealth.py — Modul ukrywania
+================================================================================
+
+Minimalizuje widocznosc procesu agenta dla operatora komputera.
+
+Techniki:
+  hide_console_window():
+    Pobiera uchwyt okna konsoli procesu (kernel32.GetConsoleWindow).
+    Jesli istnieje, ukrywa je za pomoca user32.ShowWindow z parametrem
+    SW_HIDE (0). Dzieki temu nawet jesli agent zostanie uruchomiony
+    z widoczna konsola, okno natychmiast znika.
+
+  set_process_priority_low():
+    Ustawia klase priorytetu procesu na BELOW_NORMAL_PRIORITY_CLASS
+    (0x00004000) za pomoca kernel32.SetPriorityClass. Obnizony priorytet
+    powoduje ze agent zuzuwa minimalna ilosc czasu procesora i nie
+    powoduje widocznych spowolnien systemu.
+
+  apply_stealth():
+    Wywoluje obie powyzsze funkcje. Jest wywolywana jako pierwsza
+    operacja po uruchomieniu agenta (przed jakakolwiek inna aktywnoscia).
+
+
+================================================================================
+8. defender.py — Modul wykluczen Windows Defender
+================================================================================
+
+Dodaje i usuwa wykluczenia Windows Defender bezposrednio przez rejestr.
+
+Metoda:
+  Zamiast polecen PowerShell (Add-MpPreference), ktore sa monitorowane
+  przez AMSI i flagowane jako podejrzane (MpTamperBulkExcl), modul
+  zapisuje wykluczenia bezposrednio do rejestru pod kluczami:
+  - HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths
+  - HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes
+
+  Wartosci sa typu REG_DWORD o wartosci 0. Defender odczytuje te klucze
+  i pomija wymienione sciezki/procesy podczas skanowania.
+
+  Wymaga uprawnien administratora (dostep do HKEY_LOCAL_MACHINE).
+  Flaga KEY_WOW64_64KEY zapewnia zapis do 64-bitowej galezi rejestru.
+
+Wykluczane elementy:
+  - Katalog instalacji agenta (INSTALL_DIR)
+  - Pelna sciezka do pliku wykonywalnego agenta
+  - Nazwa procesu agenta (INSTALL_FILENAME)
+
+Funkcje:
+  add_defender_exclusions()    — dodaje wykluczenia do rejestru
+  remove_defender_exclusions() — usuwa wykluczenia (przy autodestrukcji)
+
+
+================================================================================
+9. selfdestruct.py — Modul autodestrukcji
+================================================================================
+
+Realizuje dwa mechanizmy usuwania agenta z komputera ofiary.
+
+Mechanizm TTL (Time-To-Live):
+  Przy pierwszym uruchomieniu funkcja record_install_time() zapisuje
+  biezacy timestamp UTC do pliku .installed w katalogu instalacji.
+  Funkcja is_ttl_expired() porownuje zapisany czas z aktualnym —
+  jesli roznica przekracza TTL_DAYS dni (lub TTL_MINUTES minut gdy
+  TTL_DAYS=0), zwraca True i agent inicjuje autodestrukcje.
+
+Mechanizm zdalnego usuwania:
+  Komenda /delete odebrana z pokoju Matrix przez watek c2_listener
+  w main.py wywoluje bezposrednio funkcje self_destruct().
+
+Procedura self_destruct():
+  1. Usuwa wpis persystencji z rejestru (remove_registry_persistence)
+  2. Usuwa wykluczenia Windows Defender (remove_defender_exclusions)
+  3. Generuje skrypt .bat w katalogu %TEMP%, ktory:
+     - Czeka 3 sekundy (ping 127.0.0.1 -n 3) az proces agenta sie zakonczy
+     - Usuwa plik RuntimeBroker.exe
+     - Usuwa plik .installed (timestamp)
+     - Usuwa plik .debug.log
+     - Usuwa katalog instalacji (rmdir /s /q)
+     - Usuwa sam siebie (del %~f0)
+  4. Uruchamia skrypt .bat w ukrytym oknie (SW_HIDE, CREATE_NO_WINDOW)
+  5. Konczy proces agenta (sys.exit(0))
+
+  Technika self-delete przez zewnetrzny skrypt .bat jest konieczna,
+  poniewaz proces nie moze usunac wlasnego pliku wykonywalnego
+  w trakcie dzialania.
